@@ -1,6 +1,8 @@
 use std::io::{BufRead, BufReader, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
+use std::sync::mpsc::{self, RecvTimeoutError};
+use std::thread;
 use std::time::Duration;
 
 use super::discovery::discover_cdp_url;
@@ -242,7 +244,7 @@ fn try_launch_chrome(chrome_path: &Path, options: &LaunchOptions) -> Result<Chro
     let mut child = Command::new(chrome_path)
         .args(&args)
         .stdin(Stdio::null())
-        .stdout(Stdio::null())
+        .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .spawn()
         .map_err(|e| {
@@ -250,14 +252,15 @@ fn try_launch_chrome(chrome_path: &Path, options: &LaunchOptions) -> Result<Chro
             format!("Failed to launch Chrome at {:?}: {}", chrome_path, e)
         })?;
 
-    let stderr = child.stderr.take().ok_or_else(|| {
+    let stderr = child.stderr.take();
+    let stdout = child.stdout.take();
+    if stderr.is_none() && stdout.is_none() {
         let _ = child.kill();
         cleanup_temp_dir(&temp_user_data_dir);
-        "Failed to capture Chrome stderr".to_string()
-    })?;
-    let reader = BufReader::new(stderr);
+        return Err("Failed to capture Chrome stdout or stderr".to_string());
+    }
 
-    let ws_url = match wait_for_ws_url(reader) {
+    let ws_url = match wait_for_ws_url(stdout, stderr) {
         Ok(url) => url,
         Err(e) => {
             let _ = child.kill();
@@ -273,23 +276,65 @@ fn try_launch_chrome(chrome_path: &Path, options: &LaunchOptions) -> Result<Chro
     })
 }
 
-fn wait_for_ws_url(reader: BufReader<std::process::ChildStderr>) -> Result<String, String> {
+fn wait_for_ws_url(
+    stdout: Option<std::process::ChildStdout>,
+    stderr: Option<std::process::ChildStderr>,
+) -> Result<String, String> {
     let deadline = std::time::Instant::now() + Duration::from_secs(30);
     let prefix = "DevTools listening on ";
     let mut stderr_lines: Vec<String> = Vec::new();
 
-    for line in reader.lines() {
-        if std::time::Instant::now() > deadline {
+    let (tx, rx) = mpsc::channel::<(bool, String)>();
+
+    if let Some(out) = stdout {
+        let tx_out = tx.clone();
+        thread::spawn(move || {
+            let reader = BufReader::new(out);
+            for line in reader.lines().flatten() {
+                let _ = tx_out.send((true, line));
+            }
+        });
+    }
+
+    if let Some(err) = stderr {
+        let tx_err = tx.clone();
+        thread::spawn(move || {
+            let reader = BufReader::new(err);
+            for line in reader.lines().flatten() {
+                let _ = tx_err.send((false, line));
+            }
+        });
+    }
+
+    drop(tx);
+
+    loop {
+        let now = std::time::Instant::now();
+        if now > deadline {
             return Err(chrome_launch_error(
                 "Timeout waiting for Chrome DevTools URL",
                 &stderr_lines,
             ));
         }
-        let line = line.map_err(|e| format!("Failed to read Chrome stderr: {}", e))?;
-        if let Some(url) = line.strip_prefix(prefix) {
-            return Ok(url.trim().to_string());
+
+        let timeout = deadline.saturating_duration_since(now);
+        match rx.recv_timeout(timeout) {
+            Ok((from_stdout, line)) => {
+                if let Some(url) = line.strip_prefix(prefix) {
+                    return Ok(url.trim().to_string());
+                }
+                if !from_stdout {
+                    stderr_lines.push(line);
+                }
+            }
+            Err(RecvTimeoutError::Timeout) => {
+                return Err(chrome_launch_error(
+                    "Timeout waiting for Chrome DevTools URL",
+                    &stderr_lines,
+                ));
+            }
+            Err(RecvTimeoutError::Disconnected) => break,
         }
-        stderr_lines.push(line);
     }
 
     Err(chrome_launch_error(
